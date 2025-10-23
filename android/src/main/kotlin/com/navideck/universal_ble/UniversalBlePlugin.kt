@@ -32,6 +32,7 @@ import io.flutter.plugin.common.PluginRegistry
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CopyOnWriteArrayList
 
 
 private const val TAG = "UniversalBlePlugin"
@@ -53,11 +54,11 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
     // Flutter Futures
     private var bluetoothEnableRequestFuture: ((Result<Boolean>) -> Unit)? = null
     private var bluetoothDisableRequestFuture: ((Result<Boolean>) -> Unit)? = null
-    private val discoverServicesFutureList = mutableListOf<DiscoverServicesFuture>()
-    private val mtuResultFutureList = mutableListOf<MtuResultFuture>()
-    private val readResultFutureList = mutableListOf<ReadResultFuture>()
-    private val writeResultFutureList = mutableListOf<WriteResultFuture>()
-    private val subscriptionResultFutureList = mutableListOf<SubscriptionResultFuture>()
+    private val discoverServicesFutureList = CopyOnWriteArrayList<DiscoverServicesFuture>()
+    private val mtuResultFutureList = CopyOnWriteArrayList<MtuResultFuture>()
+    private val readResultFutureList = CopyOnWriteArrayList<ReadResultFuture>()
+    private val writeResultFutureList = CopyOnWriteArrayList<WriteResultFuture>()
+    private val subscriptionResultFutureList = CopyOnWriteArrayList<SubscriptionResultFuture>()
     private val pairResultFutures = mutableMapOf<String, (Result<Boolean>) -> Unit>()
 
     override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
@@ -249,12 +250,18 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
     }
 
     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+        val deviceId = gatt.device.address
         if (status != BluetoothGatt.GATT_SUCCESS) {
-            discoverServicesFutureList.filter { it.deviceId == gatt.device.address }.forEach {
-                discoverServicesFutureList.remove(it)
-                it.result(
-                    Result.failure(FlutterError("Failed", "Failed to discover services", null))
-                )
+            mainThreadHandler?.post {
+                val snapshot = discoverServicesFutureList.toList()
+                for (future in snapshot) {
+                    if (future.deviceId == deviceId) {
+                        discoverServicesFutureList.remove(future)
+                        future.result(
+                            Result.failure(FlutterError("Failed", "Failed to discover services", null))
+                        )
+                    }
+                }
             }
             return
         }
@@ -270,9 +277,14 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
                 }
             )
         }
-        discoverServicesFutureList.filter { it.deviceId == gatt.device.address }.forEach {
-            discoverServicesFutureList.remove(it)
-            it.result(Result.success(universalBleServices))
+        mainThreadHandler?.post {
+            val snapshot = discoverServicesFutureList.toList()
+            for (future in snapshot) {
+                if (future.deviceId == deviceId) {
+                    discoverServicesFutureList.remove(future)
+                    future.result(Result.success(universalBleServices))
+                }
+            }
         }
     }
 
@@ -399,26 +411,37 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         value: ByteArray,
         status: Int,
     ) {
-        readResultFutureList.filter {
-            it.deviceId == gatt.device.address &&
-                    it.characteristicId == characteristic.uuid.toString() &&
-                    it.serviceId == characteristic.service.uuid.toString()
-        }.forEach {
-            readResultFutureList.remove(it)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                it.result(Result.success(value))
-            } else {
-                it.result(
-                    Result.failure(
-                        FlutterError(
-                            status.toString(),
-                            "Failed to read: (${status.parseGattErrorCode()})",
-                            null,
-                        )
-                    )
-                )
-            }
+        val deviceId = gatt.device.address
+        val charId = characteristic.uuid.toString()
+        val serviceId = characteristic.service?.uuid?.toString()
 
+        if (serviceId == null) {
+            Log.e(TAG, "onCharacteristicRead: null serviceId")
+            return
+        }
+
+        mainThreadHandler?.post {
+            val snapshot = readResultFutureList.toList()
+            for (future in snapshot) {
+                if (future.deviceId == deviceId &&
+                    future.characteristicId == charId &&
+                    future.serviceId == serviceId) {
+                    readResultFutureList.remove(future)
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        future.result(Result.success(value))
+                    } else {
+                        future.result(
+                            Result.failure(
+                                FlutterError(
+                                    status.toString(),
+                                    "Failed to read: (${status.parseGattErrorCode()})",
+                                    null,
+                                )
+                            )
+                        )
+                    }
+                }
+            }
         }
     }
 
@@ -513,24 +536,36 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         characteristic: BluetoothGattCharacteristic,
         status: Int,
     ) {
-        writeResultFutureList.filter {
-            it.deviceId == gatt?.device?.address &&
-                    it.characteristicId == characteristic.uuid.toString() &&
-                    it.serviceId == characteristic.service.uuid.toString()
-        }.forEach {
-            writeResultFutureList.remove(it)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                it.result(Result.success(Unit))
-            } else {
-                it.result(
-                    Result.failure(
-                        FlutterError(
-                            status.toString(),
-                            "Failed to write: (${status.parseGattErrorCode()})",
-                            null,
+        val deviceId = gatt?.device?.address
+        val charId = characteristic.uuid.toString()
+        val serviceId = characteristic.service?.uuid?.toString()
+
+        if (deviceId == null || serviceId == null) {
+            Log.e(TAG, "onCharacteristicWrite: null deviceId or serviceId")
+            return
+        }
+
+        mainThreadHandler?.post {
+            val snapshot = writeResultFutureList.toList()
+            for (future in snapshot) {
+                if (future.deviceId == deviceId &&
+                    future.characteristicId == charId &&
+                    future.serviceId == serviceId) {
+                    writeResultFutureList.remove(future)
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        future.result(Result.success(Unit))
+                    } else {
+                        future.result(
+                            Result.failure(
+                                FlutterError(
+                                    status.toString(),
+                                    "Failed to write: (${status.parseGattErrorCode()})",
+                                    null,
+                                )
+                            )
                         )
-                    )
-                )
+                    }
+                }
             }
         }
     }
@@ -547,13 +582,23 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
     }
 
     override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-        val deviceId = gatt?.device?.address ?: return
-        mtuResultFutureList.filter { it.deviceId == deviceId }.forEach {
-            mtuResultFutureList.remove(it)
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                it.result(Result.success(mtu.toLong()))
-            } else {
-                it.result(Result.failure(FlutterError("Failed to change MTU", null, null)))
+        val deviceId = gatt?.device?.address
+        if (deviceId == null) {
+            Log.e(TAG, "onMtuChanged: null deviceId")
+            return
+        }
+
+        mainThreadHandler?.post {
+            val snapshot = mtuResultFutureList.toList()
+            for (future in snapshot) {
+                if (future.deviceId == deviceId) {
+                    mtuResultFutureList.remove(future)
+                    if (status == BluetoothGatt.GATT_SUCCESS) {
+                        future.result(Result.success(mtu.toLong()))
+                    } else {
+                        future.result(Result.failure(FlutterError("Failed to change MTU", null, null)))
+                    }
+                }
             }
         }
     }
@@ -856,14 +901,12 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         override fun onScanResult(callbackType: Int, result: ScanResult) {
 
             // Log.v(TAG, "onScanResult: $result")
-            var serviceUuids: Array<UUID> = arrayOf()
+            val serviceUuids = mutableSetOf<UUID>()
             result.device.uuids?.forEach {
-                serviceUuids += it.uuid
+                serviceUuids.add(it.uuid)
             }
             result.scanRecord?.serviceUuids?.forEach {
-                if (!serviceUuids.contains(it.uuid)) {
-                    serviceUuids += it.uuid
-                }
+                serviceUuids.add(it.uuid)
             }
 
             val name = result.device.name
@@ -872,7 +915,7 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
             if (!universalBleFilterUtil.filterDevice(
                     name,
                     manufacturerDataList,
-                    serviceUuids
+                    serviceUuids.toTypedArray()
                 )
             ) return
 
@@ -957,25 +1000,28 @@ class UniversalBlePlugin : UniversalBlePlatformChannel, BluetoothGattCallback(),
         service: String,
         status: Int,
     ) {
-        subscriptionResultFutureList.filter {
-            it.deviceId == deviceId &&
-                    it.characteristicId == characteristic &&
-                    it.serviceId == service
-        }.forEach {
-            subscriptionResultFutureList.remove(it)
-            val error: String? = status.parseGattErrorCode()
-            if (error != null) {
-                it.result(
-                    Result.failure(
-                        FlutterError(
-                            status.toString(),
-                            "Failed to update subscription state: $error",
-                            null,
+        mainThreadHandler?.post {
+            val snapshot = subscriptionResultFutureList.toList()
+            for (future in snapshot) {
+                if (future.deviceId == deviceId &&
+                    future.characteristicId == characteristic &&
+                    future.serviceId == service) {
+                    subscriptionResultFutureList.remove(future)
+                    val error: String? = status.parseGattErrorCode()
+                    if (error != null) {
+                        future.result(
+                            Result.failure(
+                                FlutterError(
+                                    status.toString(),
+                                    "Failed to update subscription state: $error",
+                                    null,
+                                )
+                            )
                         )
-                    )
-                )
-            } else {
-                it.result(Result.success(Unit))
+                    } else {
+                        future.result(Result.success(Unit))
+                    }
+                }
             }
         }
     }
